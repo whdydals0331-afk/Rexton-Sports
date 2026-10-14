@@ -36,8 +36,8 @@ final class Category {
     });
 
     static final Category MUSIC = new Category("music", "🎵", "음악", 0xFF3E1F5C, new String[][]{
-            {"com.iloen.melon", "멜론"},
             {"com.google.android.apps.youtube.music", "YouTube Music"},
+            {"com.iloen.melon", "멜론"},
             {"com.ktmusic.geniemusic", "지니"},
             {"com.spotify.music", "Spotify"},
             {"skplanet.musicmate", "FLO"},
