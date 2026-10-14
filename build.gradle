@@ -1,0 +1,4 @@
+// 최상위 빌드 파일. 라이브러리 의존성은 없고 Android Gradle Plugin 만 씁니다.
+plugins {
+    id 'com.android.application' version '8.7.3' apply false
+}

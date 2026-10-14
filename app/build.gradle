@@ -1,0 +1,53 @@
+plugins {
+    id 'com.android.application'
+}
+
+// GitHub Actions 빌드 번호. 빌드할 때마다 1씩 올라가서, 새 APK 가 옛 APK 위에 "업데이트"로 설치된다.
+// 로컬 빌드(환경변수 없음)는 1.
+def runNumber = (System.getenv("GITHUB_RUN_NUMBER") ?: "1").toInteger()
+
+android {
+    namespace 'com.rexton.carmode'
+    compileSdk 35
+
+    defaultConfig {
+        applicationId 'com.rexton.carmode'
+        minSdk 26
+        targetSdk 35
+        versionCode runNumber
+        versionName "1.0.${runNumber}"
+    }
+
+    signingConfigs {
+        debug {
+            // 저장소에 커밋된 고정 디버그 키. CI 가 매번 새 키를 만들면 서명이 달라져서
+            // 휴대폰에서 "업데이트" 설치가 안 되므로 같은 키를 계속 쓴다. (개인용 사이드로드 앱이라 허용)
+            storeFile file('debug.keystore')
+            storePassword 'android'
+            keyAlias 'androiddebugkey'
+            keyPassword 'android'
+        }
+    }
+
+    buildTypes {
+        debug {
+            signingConfig signingConfigs.debug
+            minifyEnabled false
+        }
+        release {
+            minifyEnabled false
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+
+    lint {
+        abortOnError false
+        checkReleaseBuilds false
+    }
+}
+
+// 의존성 없음: android.app.Activity 등 프레임워크 API 만 사용
