@@ -1,0 +1,72 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  N90 자동실행: 시동(부팅/깨어남) 신호를 받으면 사용자가 고른 앱(스마트폰 미러링 수신 앱)을 실행한다.
+  - 권한은 RECEIVE_BOOT_COMPLETED 하나뿐이다.
+  - 상주 서비스 없음. 예약은 AlarmManager 로만 한다.
+  - 기기 설정을 바꾸지 않는다. 앱을 지우면 완전히 원래대로 돌아간다.
+  - 이 앱의 액티비티에는 HOME 카테고리가 없다 (런처를 대체하지 않는다).
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+
+    <application
+        android:allowBackup="false"
+        android:label="@string/app_name"
+        android:theme="@android:style/Theme.Holo.NoActionBar">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:label="@string/app_name"
+            android:launchMode="singleTask"
+            android:windowSoftInputMode="stateHidden">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <activity
+            android:name=".PickerActivity"
+            android:exported="false"
+            android:label="실행할 앱 고르기" />
+
+        <!--
+          시스템 신호 수신기. 시스템 방송을 받아야 하므로 exported="true".
+          (다른 앱이 아래 action 을 보내도 "고른 앱 실행 예약"밖에 못 하고, 120초 쿨다운이 걸린다)
+        -->
+        <receiver
+            android:name=".TriggerReceiver"
+            android:exported="true">
+            <intent-filter>
+                <!-- 진짜 부팅 완료 -->
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <!-- 퀵부트(빠른 부팅) 계열: 일부 제조사/헤드유닛이 보냄 -->
+                <action android:name="android.intent.action.QUICKBOOT_POWERON" />
+                <action android:name="com.htc.intent.action.QUICKBOOT_POWERON" />
+                <!-- 잠금 해제(화면 켜짐 후). 잠금화면이 없는 기기에서도 오는 경우가 있음 -->
+                <action android:name="android.intent.action.USER_PRESENT" />
+                <!-- 외부 전원 연결 -->
+                <action android:name="android.intent.action.ACTION_POWER_CONNECTED" />
+                <!--
+                  아래 4개는 검증되지 않은 추측이다 (일부 중국산 헤드유닛의 ACC(시동) 신호 이름).
+                  N90 이 보내는지 모른다. 듣기만 하는 데는 비용이 없어서 넣어 두었고, 오면 기록에 남는다.
+                -->
+                <action android:name="android.intent.action.ACC_ON" />
+                <action android:name="com.android.action.ACC_ON" />
+                <action android:name="android.intent.action.ACC_ON_BROADCAST" />
+                <action android:name="com.cayboy.action.ACC_ON" />
+            </intent-filter>
+            <intent-filter>
+                <!-- 이 앱이 업데이트됨: 기록만 하고 절대 실행하지 않는다 -->
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
+
+        <!-- 내부 예약 실행 수신기 (AlarmManager 전용). 외부 앱은 보낼 수 없다. -->
+        <receiver
+            android:name=".StepReceiver"
+            android:exported="false" />
+    </application>
+</manifest>
