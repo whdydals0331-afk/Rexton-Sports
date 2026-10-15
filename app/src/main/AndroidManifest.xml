@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
   렉스턴 차량모드. 권한 없음(인터넷·위치·접근성·백그라운드 서비스 모두 없음).
-  하는 일: 큰 가로 화면에서 네비/음악/유튜브 앱을 대신 실행해 주는 런처일 뿐.
+  하는 일: 큰 화면에서 네비/음악/유튜브 앱을 대신 실행해 주는 런처일 뿐.
 -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
@@ -46,10 +46,15 @@
         android:supportsRtl="false"
         android:theme="@style/CarTheme">
 
+        <!--
+          화면 방향은 실행 중에 MainActivity 가 정한다 (📱 자동/세로/가로, setRequestedOrientation).
+          configChanges: 회전해도 화면을 새로 만들지 않고 onConfigurationChanged 에서 배치만 다시 그린다
+          (출발 모드 진행 상태·예약된 단계가 끊기지 않게).
+        -->
         <activity
             android:name=".MainActivity"
             android:exported="true"
-            android:screenOrientation="sensorLandscape"
+            android:screenOrientation="unspecified"
             android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|uiMode|density"
             android:launchMode="singleTask"
             android:resizeableActivity="true">

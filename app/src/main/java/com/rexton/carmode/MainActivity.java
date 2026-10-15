@@ -4,13 +4,16 @@ import android.app.Activity;
 import android.app.AlertDialog;
 import android.content.DialogInterface;
 import android.content.Intent;
+import android.content.pm.ActivityInfo;
 import android.content.pm.PackageManager;
 import android.content.res.ColorStateList;
+import android.content.res.Configuration;
 import android.graphics.Color;
 import android.graphics.Typeface;
 import android.graphics.drawable.Drawable;
 import android.graphics.drawable.GradientDrawable;
 import android.graphics.drawable.RippleDrawable;
+import android.hardware.display.DisplayManager;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
@@ -40,8 +43,14 @@ import java.util.List;
 import java.util.Locale;
 
 /**
- * 차량모드 메인 화면. 가로 고정 · 전체화면 · 화면 켜짐 유지.
- * Smart View 로 차 화면(약 1024x600)에 그대로 미러링되므로 글자·버튼을 크게 만든다.
+ * 차량모드 메인 화면. 전체화면 · 화면 켜짐 유지.
+ * Smart View 로 차 화면에 그대로 미러링되므로 글자·버튼을 크게 만든다.
+ *
+ * 화면 방향은 실행 중에 정한다 (setRequestedOrientation, 매니페스트는 unspecified):
+ *  - 📱 자동(기본): 미러링 감지되면 가로, 아니면 세로 (휴대폰 거치대가 세로만 되기 때문)
+ *  - 📱 세로 / 📱 가로: 고정 (미러링 감지가 안 되는 경우의 대비책)
+ * 회전해도 화면(Activity)을 새로 만들지 않고(configChanges), 화면 구성만 다시 그린다.
+ * 출발 모드 상태·예약된 단계·고른 앱은 필드/설정에 있으므로 다시 그려도 그대로 남는다.
  *
  * 레이아웃은 XML 대신 코드로 만든다 (리소스 ID 가 필요 없어서 첫 빌드 실패 위험이 적다).
  * 글자 크기는 sp 가 아니라 dp 로 준다: 휴대폰 "글자 크기"를 키워 둔 경우에도 칸이 넘치지 않게.
@@ -57,6 +66,9 @@ public class MainActivity extends Activity {
     private TextView dateView;
     private LinearLayout root;
     private int basePad;
+    /** 지금 화면이 세로 배치로 그려져 있는가 / 그때의 화면 밀도. 달라지면 다시 그린다. */
+    private boolean builtPortrait;
+    private int builtDensity;
 
     /** 칸별 화면 요소. Category.ALL 과 같은 순서. */
     private final List<TileViews> tiles = new ArrayList<>();
@@ -101,6 +113,50 @@ public class MainActivity extends Activity {
     private TextView statusGo;
     private TextView statusCancel;
     private TextView autoToggle;
+    /** 상태 줄에 지금 보이는 문구 ("🚗 " 앞머리 없이). 화면을 다시 그릴 때 되살린다. */
+    private String depMsg;
+
+    // ───── 화면 방향 ─────
+    private static final String K_ORIENT = "orient_mode";
+    private static final String ORIENT_AUTO = "auto";
+    private static final String ORIENT_PORTRAIT = "portrait";
+    private static final String ORIENT_LANDSCAPE = "landscape";
+    /** 디스플레이 변화 신호가 연달아 올 때(연결 중) 한 번만 판단하도록 잠깐 기다린다. */
+    private static final long ORIENT_CHECK_DELAY_MS = 500L;
+
+    private TextView orientBtn;
+    private DisplayManager displayManager;
+    private boolean displayListening;
+    /** 마지막 판단 결과. null = 아직 판단 안 함. */
+    private Boolean lastMirroring;
+    /** 마지막으로 요청한 방향 (같은 값을 또 요청하지 않게). */
+    private int requestedOrient = Integer.MIN_VALUE;
+
+    private final Runnable orientCheck = new Runnable() {
+        @Override
+        public void run() {
+            applyOrientation(true);
+        }
+    };
+
+    private final DisplayManager.DisplayListener displayListener = new DisplayManager.DisplayListener() {
+        @Override
+        public void onDisplayAdded(int displayId) {
+            scheduleOrientCheck();
+        }
+
+        @Override
+        public void onDisplayRemoved(int displayId) {
+            scheduleOrientCheck();
+        }
+
+        @Override
+        public void onDisplayChanged(int displayId) {
+            // 기본 화면의 변화(회전·주사율 전환 등)는 자주 오고 미러링과 상관없어서 무시한다.
+            // 추가 디스플레이는 연결 직후 이름·속성이 채워질 수 있어 다시 판단한다.
+            if (displayId != android.view.Display.DEFAULT_DISPLAY) scheduleOrientCheck();
+        }
+    };
 
     private final Runnable stepMusic = new Runnable() {
         @Override
@@ -146,6 +202,7 @@ public class MainActivity extends Activity {
             lp.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
             getWindow().setAttributes(lp);
         }
+        applyOrientation(true); // 방향을 먼저 요청 (바뀌면 onConfigurationChanged 에서 다시 그림)
         setContentView(buildUi());
         restoreDepartureState(savedInstanceState);
 
@@ -186,6 +243,8 @@ public class MainActivity extends Activity {
     @Override
     protected void onResume() {
         super.onResume();
+        startDisplayWatch();
+        applyOrientation(true); // 뒤에 있는 동안 미러링이 시작/종료됐을 수 있다 (예: Smart View 에서 돌아옴)
         hideSystemUi();
         refreshTiles(); // 그 사이에 앱을 설치/삭제했을 수 있으므로 매번 다시 확인
         refreshAutoToggle();
@@ -208,6 +267,7 @@ public class MainActivity extends Activity {
     protected void onPause() {
         super.onPause();
         handler.removeCallbacks(clockTick);
+        stopDisplayWatch();
         // depLeftAt == 0: 한 번 떠났다 돌아온 뒤(늦게 돌아와 버튼만 남긴 경우 포함)에는 다시 자동으로 잇지 않는다
         if (depState == DEP_WAITING && !depLeftForSmartView && depLeftAt == 0L) {
             depLeftForSmartView = true;
@@ -262,6 +322,35 @@ public class MainActivity extends Activity {
                 && i.getCategories() != null && i.getCategories().contains(Intent.CATEGORY_LAUNCHER);
     }
 
+    /** 회전(세로↔가로)·밀도 변경: 화면을 새로 만들지 않고 화면 구성만 다시 그린다. */
+    @Override
+    public void onConfigurationChanged(Configuration newConfig) {
+        super.onConfigurationChanged(newConfig);
+        if (root == null || isPortrait(newConfig) != builtPortrait || newConfig.densityDpi != builtDensity) {
+            rebuildUi();
+        }
+    }
+
+    /**
+     * 화면 구성을 다시 만든다. 출발 모드 상태(depState·depMsg·예약된 Handler 단계)는 필드에 있으므로
+     * 건드리지 않고, 새 상태 줄에 같은 내용을 다시 보여 주기만 한다. 자동 출발을 다시 판단하지도 않는다.
+     */
+    private void rebuildUi() {
+        setContentView(buildUi());
+        setDepState(depState, depMsg);
+        refreshTiles();
+        refreshAutoToggle();
+        updateClock();
+        hideSystemUi();
+        root.requestApplyInsets(); // 새 root 에 펀치홀·시스템 바 여백을 다시 받는다
+    }
+
+    private static boolean isPortrait(Configuration c) {
+        if (c.orientation == Configuration.ORIENTATION_PORTRAIT) return true;
+        if (c.orientation == Configuration.ORIENTATION_LANDSCAPE) return false;
+        return c.screenHeightDp > c.screenWidthDp;
+    }
+
     @Override
     public void onWindowFocusChanged(boolean hasFocus) {
         super.onWindowFocusChanged(hasFocus);
@@ -271,7 +360,13 @@ public class MainActivity extends Activity {
     // ───────────────────────── 화면 구성 ─────────────────────────
 
     private View buildUi() {
-        basePad = dp(12);
+        Configuration cfg = getResources().getConfiguration();
+        final boolean portrait = isPortrait(cfg);
+        builtPortrait = portrait;
+        builtDensity = cfg.densityDpi;
+        tiles.clear(); // 칸 화면 요소는 새로 만든다 (고른 앱은 설정에 저장돼 있음)
+
+        basePad = dp(portrait ? 10 : 12);
         root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
         root.setBackgroundColor(0xFF0B0F14);
@@ -279,35 +374,44 @@ public class MainActivity extends Activity {
         root.setOnApplyWindowInsetsListener(new View.OnApplyWindowInsetsListener() {
             @Override
             public WindowInsets onApplyWindowInsets(View v, WindowInsets insets) {
-                applyInsets(insets);
+                applyInsets(v, insets);
                 return insets;
             }
         });
 
-        root.addView(buildTopBar(), new LinearLayout.LayoutParams(
+        root.addView(portrait ? buildTopBarPortrait() : buildTopBar(), new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 
-        LinearLayout.LayoutParams slp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(52));
+        // 세로: 상태 줄을 두 줄(문구 / 버튼)로 → 높이는 내용만큼. 가로: 지금처럼 한 줄.
+        LinearLayout.LayoutParams slp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
+                portrait ? ViewGroup.LayoutParams.WRAP_CONTENT : dp(52));
         slp.setMargins(0, dp(6), 0, 0);
-        root.addView(buildStatusRow(), slp);
+        root.addView(buildStatusRow(portrait), slp);
 
-        LinearLayout tileRow = new LinearLayout(this);
-        tileRow.setOrientation(LinearLayout.HORIZONTAL);
+        // 세 칸: 가로 화면은 옆으로 나란히, 세로 화면은 위아래로 쌓는다
+        LinearLayout tileBox = new LinearLayout(this);
+        tileBox.setOrientation(portrait ? LinearLayout.VERTICAL : LinearLayout.HORIZONTAL);
         for (Category cat : Category.ALL) {
-            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f);
-            lp.setMargins(dp(6), dp(6), dp(6), dp(6));
-            tileRow.addView(buildTile(cat), lp);
+            LinearLayout.LayoutParams lp;
+            if (portrait) {
+                lp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f);
+                lp.setMargins(dp(2), dp(5), dp(2), dp(5));
+            } else {
+                lp = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f);
+                lp.setMargins(dp(6), dp(6), dp(6), dp(6));
+            }
+            tileBox.addView(buildTile(cat, portrait), lp);
         }
-        root.addView(tileRow, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
+        root.addView(tileBox, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
 
-        root.addView(buildBottomRow(), new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, dp(56)));
+        root.addView(buildBottomRow(portrait), new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(portrait ? 60 : 56)));
         return root;
     }
 
     /** 펀치홀(카메라 구멍)과, 혹시 보이는 시스템 바를 피해 여백을 준다. Android 15 는 앱을 화면 끝까지 그린다. */
     @SuppressWarnings("deprecation")
-    private void applyInsets(WindowInsets insets) {
+    private void applyInsets(View v, WindowInsets insets) {
         int l = 0, t = 0, r = 0, b = 0;
         if (Build.VERSION.SDK_INT >= 30) {
             android.graphics.Insets in = insets.getInsets(
@@ -331,9 +435,10 @@ public class MainActivity extends Activity {
                 }
             }
         }
-        root.setPadding(basePad + l, basePad + t, basePad + r, basePad + b);
+        v.setPadding(basePad + l, basePad + t, basePad + r, basePad + b);
     }
 
+    /** 가로 화면 위쪽 줄 (한 줄): 시계 · 날짜 · 출발 모드 · ⚙ · 📱 방향 · ? · Smart View */
     private View buildTopBar() {
         LinearLayout bar = new LinearLayout(this);
         bar.setOrientation(LinearLayout.HORIZONTAL);
@@ -343,13 +448,86 @@ public class MainActivity extends Activity {
         clockView = text("00:00", 52, TEXT, true);
         bar.addView(clockView);
 
-        // 날짜는 남는 폭만 쓴다 (출발 모드 버튼이 들어가서 폭이 모자라면 날짜가 줄어든다)
+        // 날짜는 남는 폭만 쓴다 (버튼이 많아 폭이 모자라면 날짜가 줄어든다)
         dateView = text("", 22, TEXT_DIM, false);
         dateView.setPadding(dp(16), 0, dp(8), 0);
         dateView.setSingleLine(true);
         dateView.setEllipsize(TextUtils.TruncateAt.END);
         bar.addView(dateView, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
 
+        LinearLayout.LayoutParams alp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(52));
+        alp.setMargins(0, 0, dp(6), 0);
+        bar.addView(makeAutoToggle(), alp);
+
+        LinearLayout.LayoutParams glp = new LinearLayout.LayoutParams(dp(52), dp(52));
+        glp.setMargins(0, 0, dp(10), 0);
+        bar.addView(makeDepGear(), glp);
+
+        LinearLayout.LayoutParams olp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(52));
+        olp.setMargins(0, 0, dp(10), 0);
+        bar.addView(makeOrientButton(), olp);
+
+        LinearLayout.LayoutParams hlp = new LinearLayout.LayoutParams(dp(52), dp(52));
+        hlp.setMargins(0, 0, dp(10), 0);
+        bar.addView(makeHelpButton(), hlp);
+
+        // 가로 줄은 폭이 빠듯해서 "연결" 은 뺀다 (세로 화면에서는 "📺 Smart View 연결")
+        TextView smart = makeSmartButton("📺 Smart View");
+        smart.setPadding(dp(16), 0, dp(16), 0);
+        bar.addView(smart, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(52)));
+        return bar;
+    }
+
+    /**
+     * 세로 화면 위쪽 (세 줄, 폭 360~411dp 기준):
+     *  1) 시계 ············ [📱 자동] [?]      (날짜는 숨김)
+     *  2) [📺 Smart View 연결 ················]
+     *  3) [🚗 출발 모드: 켜짐 ·········] [⚙]
+     */
+    private View buildTopBarPortrait() {
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        box.setPadding(dp(4), 0, dp(4), 0);
+
+        LinearLayout row1 = new LinearLayout(this);
+        row1.setOrientation(LinearLayout.HORIZONTAL);
+        row1.setGravity(Gravity.CENTER_VERTICAL);
+        clockView = text("00:00", 46, TEXT, true);
+        clockView.setSingleLine(true);
+        row1.addView(clockView, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        // 날짜 칸은 만들어 두되(시계 갱신 코드 공용) 세로 화면에서는 숨긴다
+        dateView = text("", 20, TEXT_DIM, false);
+        dateView.setVisibility(View.GONE);
+        row1.addView(dateView);
+        LinearLayout.LayoutParams olp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(52));
+        olp.setMargins(dp(8), 0, dp(8), 0);
+        row1.addView(makeOrientButton(), olp);
+        row1.addView(makeHelpButton(), new LinearLayout.LayoutParams(dp(52), dp(52)));
+        box.addView(row1, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        TextView smart = makeSmartButton("📺 Smart View 연결");
+        LinearLayout.LayoutParams slp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(52));
+        slp.setMargins(0, dp(6), 0, 0);
+        box.addView(smart, slp);
+
+        LinearLayout row3 = new LinearLayout(this);
+        row3.setOrientation(LinearLayout.HORIZONTAL);
+        row3.setGravity(Gravity.CENTER_VERTICAL);
+        TextView toggle = makeAutoToggle();
+        toggle.setEllipsize(TextUtils.TruncateAt.END);
+        row3.addView(toggle, new LinearLayout.LayoutParams(0, dp(52), 1f));
+        LinearLayout.LayoutParams glp = new LinearLayout.LayoutParams(dp(52), dp(52));
+        glp.setMargins(dp(8), 0, 0, 0);
+        row3.addView(makeDepGear(), glp);
+        LinearLayout.LayoutParams r3 = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT);
+        r3.setMargins(0, dp(6), 0, 0);
+        box.addView(row3, r3);
+        return box;
+    }
+
+    private TextView makeAutoToggle() {
         autoToggle = button("", BTN_BG);
         autoToggle.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 20);
         autoToggle.setPadding(dp(14), 0, dp(14), 0);
@@ -364,10 +542,10 @@ public class MainActivity extends Activity {
                         : "출발 모드 꺼짐 — 필요하면 아래 \"🚗 출발\" 을 누르세요");
             }
         });
-        LinearLayout.LayoutParams alp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(52));
-        alp.setMargins(0, 0, dp(6), 0);
-        bar.addView(autoToggle, alp);
+        return autoToggle;
+    }
 
+    private TextView makeDepGear() {
         TextView depGear = button("⚙", BTN_BG);
         depGear.setPadding(0, 0, 0, 0);
         depGear.setOnClickListener(new View.OnClickListener() {
@@ -376,10 +554,10 @@ public class MainActivity extends Activity {
                 showDepartureSettings();
             }
         });
-        LinearLayout.LayoutParams glp = new LinearLayout.LayoutParams(dp(52), dp(52));
-        glp.setMargins(0, 0, dp(10), 0);
-        bar.addView(depGear, glp);
+        return depGear;
+    }
 
+    private TextView makeHelpButton() {
         TextView help = button("?", BTN_BG);
         help.setPadding(0, 0, 0, 0);
         help.setOnClickListener(new View.OnClickListener() {
@@ -388,47 +566,106 @@ public class MainActivity extends Activity {
                 showHelp(null);
             }
         });
-        LinearLayout.LayoutParams hlp = new LinearLayout.LayoutParams(dp(52), dp(52));
-        hlp.setMargins(0, 0, dp(10), 0);
-        bar.addView(help, hlp);
+        return help;
+    }
 
-        TextView smart = button("📺 Smart View 연결", 0xFF0D47A1);
+    private TextView makeSmartButton(String label) {
+        TextView smart = button(label, 0xFF0D47A1);
         smart.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
                 SmartView.open(MainActivity.this);
             }
         });
-        bar.addView(smart, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(52)));
-        return bar;
+        return smart;
     }
 
-    private View buildTile(final Category cat) {
+    /** 📱 자동 → 📱 세로 → 📱 가로 → 📱 자동 … */
+    private TextView makeOrientButton() {
+        orientBtn = button("", BTN_BG);
+        orientBtn.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 20);
+        orientBtn.setPadding(dp(12), 0, dp(12), 0);
+        orientBtn.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                String m = orientMode();
+                String next = ORIENT_AUTO.equals(m) ? ORIENT_PORTRAIT
+                        : ORIENT_PORTRAIT.equals(m) ? ORIENT_LANDSCAPE : ORIENT_AUTO;
+                Apps.prefs(MainActivity.this).edit().putString(K_ORIENT, next).apply();
+                refreshOrientButton();
+                applyOrientation(false); // 안내는 아래 토스트 하나로
+                String msg;
+                if (ORIENT_AUTO.equals(next)) {
+                    msg = "📱 자동 — 미러링 중이면 가로, 아니면 세로"
+                            + (Boolean.TRUE.equals(lastMirroring) ? " (지금: 미러링 감지됨)" : " (지금: 미러링 감지 안 됨)");
+                } else if (ORIENT_PORTRAIT.equals(next)) {
+                    msg = "📱 세로 고정";
+                } else {
+                    msg = "📱 가로 고정 — 미러링이 자동으로 감지되지 않을 때 쓰세요";
+                }
+                Apps.toast(MainActivity.this, msg);
+            }
+        });
+        refreshOrientButton();
+        return orientBtn;
+    }
+
+    private View buildTile(final Category cat, boolean portrait) {
         FrameLayout tile = new FrameLayout(this);
         tile.setBackground(pressable(cat.color, dp(20)));
         tile.setClickable(true);
         tile.setFocusable(true);
 
         LinearLayout content = new LinearLayout(this);
-        content.setOrientation(LinearLayout.VERTICAL);
-        content.setGravity(Gravity.CENTER);
-        content.setPadding(dp(8), dp(8), dp(8), dp(8));
-
-        TextView header = text(cat.emoji + " " + cat.title, 30, TEXT, true);
-        header.setGravity(Gravity.CENTER);
-        content.addView(header);
-
         ImageView icon = new ImageView(this);
         icon.setScaleType(ImageView.ScaleType.FIT_CENTER);
-        LinearLayout.LayoutParams ilp = new LinearLayout.LayoutParams(dp(72), dp(72));
-        ilp.setMargins(0, dp(12), 0, dp(8));
-        content.addView(icon, ilp);
+        TextView appLabel;
 
-        TextView appLabel = text("", 20, TEXT_DIM, false);
-        appLabel.setGravity(Gravity.CENTER);
-        appLabel.setMaxLines(2);
-        appLabel.setEllipsize(TextUtils.TruncateAt.END);
-        content.addView(appLabel);
+        if (portrait) {
+            // 세로: 왼쪽 반 = 이모지+이름, 오른쪽 반 = 앱 아이콘+앱 이름. 오른쪽 위 ⚙ 자리는 비워 둔다.
+            content.setOrientation(LinearLayout.HORIZONTAL);
+            content.setGravity(Gravity.CENTER_VERTICAL);
+            content.setPadding(dp(18), dp(6), dp(48), dp(6));
+
+            TextView header = text(cat.emoji + " " + cat.title, 28, TEXT, true);
+            header.setSingleLine(true);
+            header.setEllipsize(TextUtils.TruncateAt.END);
+            header.setGravity(Gravity.CENTER_VERTICAL | Gravity.START);
+            content.addView(header, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
+            LinearLayout side = new LinearLayout(this);
+            side.setOrientation(LinearLayout.VERTICAL);
+            side.setGravity(Gravity.CENTER);
+            side.setPadding(dp(8), 0, 0, 0);
+            LinearLayout.LayoutParams ilp = new LinearLayout.LayoutParams(dp(60), dp(60));
+            ilp.setMargins(0, 0, 0, dp(6));
+            side.addView(icon, ilp);
+            appLabel = text("", 18, TEXT_DIM, false);
+            appLabel.setGravity(Gravity.CENTER);
+            appLabel.setMaxLines(2);
+            appLabel.setEllipsize(TextUtils.TruncateAt.END);
+            side.addView(appLabel, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT));
+            content.addView(side, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        } else {
+            content.setOrientation(LinearLayout.VERTICAL);
+            content.setGravity(Gravity.CENTER);
+            content.setPadding(dp(8), dp(8), dp(8), dp(8));
+
+            TextView header = text(cat.emoji + " " + cat.title, 30, TEXT, true);
+            header.setGravity(Gravity.CENTER);
+            content.addView(header);
+
+            LinearLayout.LayoutParams ilp = new LinearLayout.LayoutParams(dp(72), dp(72));
+            ilp.setMargins(0, dp(12), 0, dp(8));
+            content.addView(icon, ilp);
+
+            appLabel = text("", 20, TEXT_DIM, false);
+            appLabel.setGravity(Gravity.CENTER);
+            appLabel.setMaxLines(2);
+            appLabel.setEllipsize(TextUtils.TruncateAt.END);
+            content.addView(appLabel);
+        }
 
         tile.addView(content, new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
@@ -442,7 +679,8 @@ public class MainActivity extends Activity {
                 showChooser(cat);
             }
         });
-        tile.addView(gear, new FrameLayout.LayoutParams(dp(56), dp(56), Gravity.TOP | Gravity.END));
+        int g = dp(portrait ? 52 : 56);
+        tile.addView(gear, new FrameLayout.LayoutParams(g, g, Gravity.TOP | Gravity.END));
 
         tile.setOnClickListener(new View.OnClickListener() {
             @Override
@@ -472,13 +710,14 @@ public class MainActivity extends Activity {
         return tile;
     }
 
-    private View buildBottomRow() {
+    private View buildBottomRow(boolean portrait) {
         LinearLayout row = new LinearLayout(this);
         row.setOrientation(LinearLayout.HORIZONTAL);
         row.setGravity(Gravity.CENTER_VERTICAL);
-        row.setPadding(dp(6), dp(4), dp(6), 0);
+        row.setPadding(dp(portrait ? 2 : 6), dp(4), dp(portrait ? 2 : 6), 0);
+        int gap = dp(portrait ? 8 : 12);
 
-        TextView phone = button("📞 전화", BTN_BG);
+        TextView phone = bottomButton("📞 전화", BTN_BG, portrait);
         phone.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
@@ -494,10 +733,10 @@ public class MainActivity extends Activity {
         });
         row.addView(phone, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f));
 
-        row.addView(new View(this), new LinearLayout.LayoutParams(dp(12), 1));
+        row.addView(new View(this), new LinearLayout.LayoutParams(gap, 1));
 
         // 출발 모드가 꺼져 있어도 지금 바로 출발 순서를 돌린다
-        TextView go = button("🚗 출발", 0xFF1B5E20);
+        TextView go = bottomButton("🚗 출발", 0xFF1B5E20, portrait);
         go.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
@@ -506,9 +745,9 @@ public class MainActivity extends Activity {
         });
         row.addView(go, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f));
 
-        row.addView(new View(this), new LinearLayout.LayoutParams(dp(12), 1));
+        row.addView(new View(this), new LinearLayout.LayoutParams(gap, 1));
 
-        TextView exit = button("🏠 나가기", BTN_BG);
+        TextView exit = bottomButton("🏠 나가기", BTN_BG, portrait);
         exit.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
@@ -519,22 +758,28 @@ public class MainActivity extends Activity {
         return row;
     }
 
-    /** 출발 순서 진행 상황 한 줄 + "음악·네비 시작 ▶" + "취소". 평소에는 숨김. */
-    private View buildStatusRow() {
+    /** 아래 줄 버튼. 세로 화면은 한 칸 폭이 약 100dp 라 글자·여백을 조금 줄인다. */
+    private TextView bottomButton(String label, int bg, boolean portrait) {
+        TextView b = button(label, bg);
+        if (portrait) {
+            b.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 20);
+            b.setPadding(dp(4), 0, dp(4), 0);
+        }
+        return b;
+    }
+
+    /**
+     * 출발 순서 진행 상황 + "음악·네비 시작 ▶" + "취소". 평소에는 숨김.
+     * 가로: 한 줄. 세로: 폭이 좁아 문구(최대 두 줄)를 위에, 버튼을 아래 오른쪽에 둔다.
+     */
+    private View buildStatusRow(boolean portrait) {
         statusRow = new LinearLayout(this);
-        statusRow.setOrientation(LinearLayout.HORIZONTAL);
-        statusRow.setGravity(Gravity.CENTER_VERTICAL);
-        statusRow.setPadding(dp(16), 0, dp(4), 0);
         GradientDrawable bg = new GradientDrawable();
         bg.setColor(0xFF15202B);
         bg.setCornerRadius(dp(14));
         statusRow.setBackground(bg);
 
-        statusText = text("", 22, TEXT, true);
-        statusText.setSingleLine(true);
-        statusText.setEllipsize(TextUtils.TruncateAt.END);
-        statusRow.addView(statusText, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
-
+        statusText = text("", portrait ? 20 : 22, TEXT, true);
         statusGo = button("음악·네비 시작 ▶", 0xFF1B5E20);
         statusGo.setOnClickListener(new View.OnClickListener() {
             @Override
@@ -542,10 +787,6 @@ public class MainActivity extends Activity {
                 if (depState == DEP_WAITING) runMediaSteps(0L);
             }
         });
-        LinearLayout.LayoutParams glp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(46));
-        glp.setMargins(dp(8), 0, 0, 0);
-        statusRow.addView(statusGo, glp);
-
         statusCancel = button("취소", BTN_BG);
         statusCancel.setOnClickListener(new View.OnClickListener() {
             @Override
@@ -555,12 +796,126 @@ public class MainActivity extends Activity {
                 if (wasActive) Apps.toast(MainActivity.this, "출발 순서를 멈췄습니다");
             }
         });
-        LinearLayout.LayoutParams clp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(46));
-        clp.setMargins(dp(8), 0, 0, 0);
-        statusRow.addView(statusCancel, clp);
+
+        if (portrait) {
+            statusRow.setOrientation(LinearLayout.VERTICAL);
+            statusRow.setPadding(dp(14), dp(10), dp(8), dp(8));
+            statusText.setMaxLines(2);
+            statusText.setEllipsize(TextUtils.TruncateAt.END);
+            statusRow.addView(statusText, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT));
+
+            LinearLayout btns = new LinearLayout(this);
+            btns.setOrientation(LinearLayout.HORIZONTAL);
+            btns.setGravity(Gravity.END | Gravity.CENTER_VERTICAL);
+            statusGo.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 20);
+            statusGo.setPadding(dp(14), 0, dp(14), 0);
+            statusCancel.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 20);
+            statusCancel.setPadding(dp(16), 0, dp(16), 0);
+            btns.addView(statusGo, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(46)));
+            LinearLayout.LayoutParams clp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(46));
+            clp.setMargins(dp(8), 0, 0, 0);
+            btns.addView(statusCancel, clp);
+            LinearLayout.LayoutParams blp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT);
+            blp.setMargins(0, dp(8), 0, 0);
+            statusRow.addView(btns, blp);
+        } else {
+            statusRow.setOrientation(LinearLayout.HORIZONTAL);
+            statusRow.setGravity(Gravity.CENTER_VERTICAL);
+            statusRow.setPadding(dp(16), 0, dp(4), 0);
+            statusText.setSingleLine(true);
+            statusText.setEllipsize(TextUtils.TruncateAt.END);
+            statusRow.addView(statusText, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
+            LinearLayout.LayoutParams glp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(46));
+            glp.setMargins(dp(8), 0, 0, 0);
+            statusRow.addView(statusGo, glp);
+
+            LinearLayout.LayoutParams clp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(46));
+            clp.setMargins(dp(8), 0, 0, 0);
+            statusRow.addView(statusCancel, clp);
+        }
 
         statusRow.setVisibility(View.GONE);
         return statusRow;
+    }
+
+    // ───────────────────────── 화면 방향 ─────────────────────────
+
+    private String orientMode() {
+        String m = Apps.prefs(this).getString(K_ORIENT, ORIENT_AUTO);
+        if (ORIENT_PORTRAIT.equals(m) || ORIENT_LANDSCAPE.equals(m)) return m;
+        return ORIENT_AUTO;
+    }
+
+    private void refreshOrientButton() {
+        if (orientBtn == null) return;
+        String m = orientMode();
+        orientBtn.setText(ORIENT_PORTRAIT.equals(m) ? "📱 세로" : ORIENT_LANDSCAPE.equals(m) ? "📱 가로" : "📱 자동");
+    }
+
+    /**
+     * 설정과 미러링 감지 결과로 화면 방향을 정한다.
+     * 자동 + 미러링 → LANDSCAPE (고정. 휴대폰이 거치대에 세워져 있어 센서 기준이면 세로가 골라지므로)
+     * 자동 + 미러링 아님 → PORTRAIT. 세로/가로 모드 → 고정.
+     * @param announce 자동 모드에서 미러링 상태가 바뀌었으면 토스트로 알린다
+     */
+    private void applyOrientation(boolean announce) {
+        boolean mirroring = SmartView.isMirroring(this);
+        Boolean prev = lastMirroring;
+        lastMirroring = mirroring;
+        String mode = orientMode();
+        int want;
+        if (ORIENT_PORTRAIT.equals(mode)) {
+            want = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT;
+        } else if (ORIENT_LANDSCAPE.equals(mode)) {
+            want = ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE;
+        } else {
+            want = mirroring ? ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE : ActivityInfo.SCREEN_ORIENTATION_PORTRAIT;
+        }
+        if (want != requestedOrient) {
+            requestedOrient = want;
+            try {
+                setRequestedOrientation(want);
+            } catch (Exception ignored) {
+                // 일부 기종·창 모드(분할 화면 등)에서는 방향 요청이 무시되거나 거부된다
+            }
+        }
+        // 처음 판단(prev == null)에서는 미러링 중일 때만 알린다 ("미러링 끝" 을 엉뚱하게 띄우지 않게)
+        boolean changed = prev == null ? mirroring : prev != mirroring;
+        if (announce && changed && ORIENT_AUTO.equals(mode)) {
+            Apps.toast(this, mirroring ? "미러링 감지 → 가로 화면" : "미러링 끝 → 세로 화면");
+        }
+    }
+
+    private void scheduleOrientCheck() {
+        handler.removeCallbacks(orientCheck);
+        handler.postDelayed(orientCheck, ORIENT_CHECK_DELAY_MS);
+    }
+
+    /** 화면이 앞에 있는 동안만 디스플레이 추가/제거를 지켜본다 (onResume ~ onPause). */
+    private void startDisplayWatch() {
+        if (displayListening) return;
+        try {
+            if (displayManager == null) displayManager = (DisplayManager) getSystemService(DISPLAY_SERVICE);
+            if (displayManager != null) {
+                displayManager.registerDisplayListener(displayListener, handler);
+                displayListening = true;
+            }
+        } catch (Exception ignored) {
+            // 지켜보기 실패: onResume 때마다 다시 판단하는 것으로 충분
+        }
+    }
+
+    private void stopDisplayWatch() {
+        handler.removeCallbacks(orientCheck);
+        if (!displayListening) return;
+        displayListening = false;
+        try {
+            if (displayManager != null) displayManager.unregisterDisplayListener(displayListener);
+        } catch (Exception ignored) {
+        }
     }
 
     // ───────────────────────── 출발 모드 ─────────────────────────
@@ -709,6 +1064,7 @@ public class MainActivity extends Activity {
 
     private void setDepState(int st, String msg) {
         depState = st;
+        depMsg = st == DEP_IDLE ? null : msg; // 화면을 다시 그릴 때(회전) 같은 문구를 되살리기 위해
         if (statusRow == null) return;
         if (st == DEP_IDLE) {
             statusRow.setVisibility(View.GONE);
@@ -891,7 +1247,13 @@ public class MainActivity extends Activity {
                         + "    (창이 안 뜨면: 빠른 설정을 화면 위에서 두 번 내려 Smart View → " + SmartView.CAR_NAME + ")\n\n"
                         + "3) 돌아오면 음악 앱이 열려 재생되고, 몇 초 뒤 네비가 앞으로 나옵니다.\n"
                         + "    돌아오지 않았다면 위의 \"음악·네비 시작 ▶\" 을 누르세요. 멈추려면 \"취소\".\n\n"
-                        + "4) 휴대폰을 가로로 두면 차 화면에 크게 나옵니다. 조작은 휴대폰에서 합니다.\n\n"
+                        + "4) 조작은 휴대폰에서 합니다.\n\n"
+                        + "📱 화면 방향 (위쪽 \"📱\" 버튼을 누를 때마다 바뀜)\n"
+                        + "  • 📱 자동(기본): 평소엔 세로, Smart View 미러링이 감지되면 저절로 가로로 바뀌어 차 화면을 꽉 채웁니다.\n"
+                        + "    이때 휴대폰에서는 화면이 옆으로 누워 보입니다 (정상).\n"
+                        + "  • 📱 세로 / 📱 가로: 항상 그 방향으로 고정.\n"
+                        + "  미러링 자동 감지는 실제 S23+ 에서 아직 확인하지 못했습니다. 미러링 중인데 가로로 안 바뀌면 \"📱 가로\" 로 두세요.\n"
+                        + "  T맵 등 다른 앱의 방향은 그 앱이 정합니다 (T맵 설정에 가로 화면 옵션이 있는지 확인해 보세요 — 미확인).\n\n"
                         + "출발 순서는 이 앱을 직접 열었을 때나 \"🚗 출발\" 을 눌렀을 때만 시작합니다. "
                         + "블루투스 연결 등으로 저절로 시작하지 않습니다. 운전 중 잠깐 돌아올 때는 다시 실행하지 않습니다.\n\n"
                         + "위쪽 \"출발 모드\" 버튼으로 켜고 끄고, 옆의 ⚙ 로 단계와 시간을 바꿉니다.\n"

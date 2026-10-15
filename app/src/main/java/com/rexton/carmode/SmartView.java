@@ -2,8 +2,13 @@ package com.rexton.carmode;
 
 import android.app.Activity;
 import android.app.AlertDialog;
+import android.content.Context;
 import android.content.Intent;
+import android.hardware.display.DisplayManager;
 import android.provider.Settings;
+import android.view.Display;
+
+import java.util.Locale;
 
 /**
  * 삼성 Smart View(화면 미러링) 열기 — 최선 노력.
@@ -60,6 +65,63 @@ final class SmartView {
 
     private static void hint(Activity a) {
         Apps.toast(a, "목록에서 " + CAR_NAME + " 를 고르세요");
+    }
+
+    /*
+     * ───── 미러링 감지 (화면 방향 "📱 자동" 용) ─────
+     *
+     * 미확인(UNVERIFIED): 삼성 Smart View 로 미러링하는 동안 안드로이드가 다른 앱에게 "추가 디스플레이"를
+     * 보여 주는지는 S23+ 실기기에서 확인하지 않았다. 표준 안드로이드의 Wi-Fi 디스플레이(Miracast)는
+     * FLAG_PRESENTATION 이 붙은 추가 디스플레이로 보이지만, 삼성이 자체 방식으로 미러링하면 아무것도
+     * 안 보일 수 있다. 그래서 감지가 안 되는 경우를 위해 "📱 세로 / 📱 가로" 수동 모드를 둔다.
+     *
+     * 판단 기준 (하나라도 맞으면 미러링 중으로 본다):
+     *  1) DISPLAY_CATEGORY_PRESENTATION 으로 돌려받은, 기본 화면이 아닌 유효한 디스플레이
+     *  2) 기본 화면이 아닌 유효한 디스플레이 중 FLAG_PRESENTATION 이 있는 것
+     *  3) 기본 화면이 아닌 유효한 디스플레이 중 이름에 Wi-Fi / Smart View / Miracast / wfd 가 들어간 것
+     * 이름이 없는 기타 가상 디스플레이(화면 녹화 등)까지 미러링으로 보면 오작동이 잦을 것 같아 넣지 않았다.
+     * 디스플레이 이름은 기록(로그)하지 않는다. 필요한 권한 없음 (DisplayManager 는 API 17+).
+     */
+    private static final String[] MIRROR_NAME_HINTS = {
+            "wi-fi", "wifi", "smart view", "smartview", "miracast", "wfd"
+    };
+
+    /** 지금 휴대폰 화면을 다른 화면(차 헤드유닛 등)으로 미러링 중인 것 같은가. 실패하면 false. */
+    static boolean isMirroring(Context c) {
+        try {
+            DisplayManager dm = (DisplayManager) c.getSystemService(Context.DISPLAY_SERVICE);
+            if (dm == null) return false;
+            Display[] pres = dm.getDisplays(DisplayManager.DISPLAY_CATEGORY_PRESENTATION);
+            if (pres != null) {
+                for (Display d : pres) {
+                    if (isExtra(d)) return true;
+                }
+            }
+            Display[] all = dm.getDisplays();
+            if (all != null) {
+                for (Display d : all) {
+                    if (!isExtra(d)) continue;
+                    if ((d.getFlags() & Display.FLAG_PRESENTATION) != 0) return true;
+                    if (nameLooksMirrored(d.getName())) return true;
+                }
+            }
+        } catch (Exception ignored) {
+            // 감지 실패 = 미러링 아님으로 본다 (수동 모드로 해결 가능)
+        }
+        return false;
+    }
+
+    private static boolean isExtra(Display d) {
+        return d != null && d.getDisplayId() != Display.DEFAULT_DISPLAY && d.isValid();
+    }
+
+    private static boolean nameLooksMirrored(String name) {
+        if (name == null) return false;
+        String n = name.toLowerCase(Locale.ROOT);
+        for (String h : MIRROR_NAME_HINTS) {
+            if (n.contains(h)) return true;
+        }
+        return false;
     }
 
     static void showManualHelp(Activity a) {
